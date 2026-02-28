@@ -115,7 +115,7 @@ jobs:
         uses: actions/deploy-pages@v4
 
   pypi-publish:
-    needs: Release
+    needs: semver
     name: Upload release to PyPI
     runs-on: ubuntu-latest
     environment:
