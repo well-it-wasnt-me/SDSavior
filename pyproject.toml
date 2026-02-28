@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sdsavior"
+version = "0.1.0"
+description = "Crash-recoverable memory-mapped ring buffer for JSON records (SD-card friendly-ish)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "CC0-1.0" }
+authors = [{ name = "Antonio D'Angelo", email = "antonio@bastardi.net" }]
+keywords = ["mmap", "ring-buffer", "jsonl", "embedded", "raspberry-pi", "durability"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: CC0 1.0 Universal (CC0 1.0) Public Domain Dedication",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: System :: Logging",
+  "Topic :: Database",
+]
+
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-cov>=5",
+  "ruff>=0.6",
+  "mypy>=1.10",
+  "mkdocs>=1.6",
+]
+
+[project.scripts]
+sdsavior = "sdsavior.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sdsavior"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+addopts = "--cov=src/sdsavior --cov-report=term-missing --cov-fail-under=90"
+testpaths = ["tests"]

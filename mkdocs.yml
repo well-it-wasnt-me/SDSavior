@@ -1,0 +1,19 @@
+site_name: SDSavior
+site_description: Crash-recoverable, memory-mapped ring buffer for JSON records.
+repo_name: sdsavior
+docs_dir: docs
+theme:
+  name: readthedocs
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Usage: usage.md
+  - CLI: cli.md
+  - API Reference: api.md
+  - Recovery and Format: recovery.md
+  - Development: development.md
+markdown_extensions:
+  - admonition
+  - codehilite
+  - toc:
+      permalink: true
