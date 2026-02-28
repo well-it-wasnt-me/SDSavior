@@ -52,3 +52,6 @@ sdsavior export --data data.ring --meta data.meta --capacity 8388608 --out out.j
 - Records are stored as JSON lines (`\\n` appended).
 - Metadata is double-buffered with CRC and a commit counter for crash recovery.
 - By default it does not fsync data pages on every append (to reduce wear); metadata is fsync'd.
+
+# TODO
+- fix ci for pypy publishing...
