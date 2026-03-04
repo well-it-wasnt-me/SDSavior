@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sdsavior"
-version = "0.1.0"
+version = "1.0.1"
 description = "Crash-recoverable memory-mapped ring buffer for JSON records (SD-card friendly-ish)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -51,3 +51,4 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 addopts = "--cov=src/sdsavior --cov-report=term-missing --cov-fail-under=90"
 testpaths = ["tests"]
+pythonpath = ["src"]
