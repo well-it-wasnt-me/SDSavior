@@ -429,7 +429,10 @@ def test_make_space_handles_corrupt_tail_record(tmp_path: Path) -> None:
         assert rb._state.tail == rb._state.head
 
 
-def test_recover_handles_non_advancing_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_recover_handles_non_advancing_record(
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch
+) -> None:
     data = tmp_path / "ring.dat"
     meta = tmp_path / "ring.meta"
 
