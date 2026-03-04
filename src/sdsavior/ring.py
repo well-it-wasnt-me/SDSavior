@@ -96,6 +96,9 @@ class SDSavior:
         fsync_meta: bool = True,
         json_dumps_kwargs: dict[str, Any] | None = None,
         recover_scan_limit_bytes: int | None = None,
+        coalesce_max_records: int | None = None,
+        coalesce_max_seconds: float | None = None,
+        sector_size: int = 0,
     ):
         """Configure file paths, durability options, and recovery behavior for a ring instance."""
         capacity = int(capacity_bytes)
@@ -117,12 +120,29 @@ class SDSavior:
         else:
             self.json_dumps_kwargs = dict(json_dumps_kwargs)
         self.recover_scan_limit_bytes = recover_scan_limit_bytes
+        self.coalesce_max_records = coalesce_max_records
+        self.coalesce_max_seconds = coalesce_max_seconds
+        self.sector_size = int(sector_size)
 
         self._data_fd: int | None = None
         self._meta_fd: int | None = None
         self._data_mm: mmap.mmap | None = None
         self._meta_mm: mmap.mmap | None = None
         self._state: MetaState | None = None
+
+        # Write coalescing state
+        self._pending: list[tuple[Any, int, int]] = []  # (obj, seq, ts_ns)
+        self._last_flush_time: float = 0.0
+
+        # Write statistics
+        self._stats: dict[str, int] = {
+            "logical_appends": 0,
+            "physical_flushes": 0,
+            "bytes_written": 0,
+        }
+
+        # CRC skip tracking
+        self._last_iter_skipped: int = 0
 
     def __enter__(self) -> SDSavior:
         """Open the ring buffer when entering a ``with`` block."""
@@ -132,6 +152,15 @@ class SDSavior:
     def __exit__(self, exc_type, exc, tb) -> None:
         """Close the ring buffer when leaving a ``with`` block."""
         self.close()
+
+    @property
+    def _coalescing_enabled(self) -> bool:
+        return self.coalesce_max_records is not None or self.coalesce_max_seconds is not None
+
+    @property
+    def write_stats(self) -> dict[str, int]:
+        """Return a copy of write statistics."""
+        return dict(self._stats)
 
     # ---------- public API ----------
 
@@ -231,6 +260,8 @@ class SDSavior:
         """Persist metadata and release mmap/file descriptors."""
         try:
             if self._state is not None:
+                if self._pending:
+                    self._flush_pending()
                 self._write_meta(self._state)
         finally:
             if self._data_mm is not None:
@@ -280,11 +311,60 @@ class SDSavior:
         """
         self._require_open()
         assert self._state is not None
+        s = self._state
+
+        self._stats["logical_appends"] += 1
+
+        if self._coalescing_enabled:
+            seq = s.seq_next
+            ts_ns = time.time_ns()
+            s.seq_next = seq + 1
+            self._pending.append((obj, seq, ts_ns))
+
+            should_flush = False
+            if (
+                self.coalesce_max_records is not None
+                and len(self._pending) >= self.coalesce_max_records
+            ):
+                should_flush = True
+            if (
+                self.coalesce_max_seconds is not None
+                and self._last_flush_time > 0
+                and (time.monotonic() - self._last_flush_time) >= self.coalesce_max_seconds
+            ):
+                should_flush = True
+            if should_flush:
+                self._flush_pending()
+            return seq
+
+        seq = s.seq_next
+        ts_ns = time.time_ns()
+        self._write_record_to_mmap(obj, seq, ts_ns)
+        s.seq_next = seq + 1
+        s.commit += 1
+        self._write_meta(s)
+        self._stats["physical_flushes"] += 1
+
+        if self.fsync_data:
+            assert self._data_mm is not None
+            assert self._data_fd is not None
+            self._data_mm.flush()
+            os.fsync(self._data_fd)
+
+        return seq
+
+    def flush(self) -> None:
+        """Force-write all buffered records to disk."""
+        self._require_open()
+        if self._pending:
+            self._flush_pending()
+
+    def _write_record_to_mmap(self, obj: Any, seq: int, ts_ns: int) -> int:
+        """Write a single record into the mmap. Does NOT write meta or fsync."""
+        assert self._state is not None
         assert self._data_mm is not None
-        assert self._data_fd is not None
         s = self._state
         mm = self._data_mm
-        data_fd = self._data_fd
         dump_kwargs: Any = self.json_dumps_kwargs
 
         payload = (json.dumps(obj, **dump_kwargs) + "\n").encode("utf-8")
@@ -303,9 +383,6 @@ class SDSavior:
             s.head = head
             self._make_space(total_len)
 
-        seq = s.seq_next
-        ts_ns = time.time_ns()
-
         reserved = 0
         hdr_wo_total_crc = struct.pack("<QQII", seq, ts_ns, payload_len, reserved)
         crc = _crc32_bytes(hdr_wo_total_crc + payload)
@@ -320,38 +397,96 @@ class SDSavior:
         if pad_end > pad_start:
             mm[pad_start:pad_end] = ZERO_PADDING[:pad_end - pad_start]
 
+        self._stats["bytes_written"] += total_len
+
         s.head = head + total_len
         if s.head >= self.capacity:
             s.head = DATA_START
 
-        s.seq_next = seq + 1
+        return total_len
+
+    def _flush_pending(self) -> None:
+        """Write all buffered records and persist metadata once."""
+        assert self._state is not None
+        assert self._data_mm is not None
+        assert self._data_fd is not None
+        s = self._state
+        mm = self._data_mm
+        data_fd = self._data_fd
+
+        if not self._pending:
+            return
+
+        write_start = s.head
+        for obj, seq, ts_ns in self._pending:
+            self._write_record_to_mmap(obj, seq, ts_ns)
+
         s.commit += 1
-
         self._write_meta(s)
+        self._stats["physical_flushes"] += 1
 
-        if self.fsync_data:
-            mm.flush()  # flush entire mapping (simple + safe)
+        # Sector-aligned flush if configured
+        if self.sector_size > 0:
+            write_end = s.head
+            self._sector_flush(mm, data_fd, write_start, write_end)
+        elif self.fsync_data:
+            mm.flush()
             os.fsync(data_fd)
 
-        return seq
+        self._pending.clear()
+        self._last_flush_time = time.monotonic()
 
-    def iter_records(self, *, from_seq: int | None = None) -> Iterator[tuple[int, int, Any]]:
+    def iter_records(
+        self,
+        *,
+        from_seq: int | None = None,
+        skip_corrupt: bool = False,
+    ) -> Iterator[tuple[int, int, Any]]:
         """
         Iterate records from tail -> head, yielding (seq, ts_ns, obj).
-        If from_seq is provided, skips older sequences.
+
+        If *from_seq* is provided, skips older sequences.
+        If *skip_corrupt* is True, corrupt records are skipped instead of
+        stopping iteration.  The number of skipped regions is stored in
+        ``_last_iter_skipped``.
         """
         self._require_open()
         assert self._state is not None
         s = self._state
+        self._last_iter_skipped = 0
 
         off = s.tail
         scanned = 0
         limit = self.capacity
+        scan_limit = self.sector_size if self.sector_size > 0 else 4096
 
         while off != s.head and scanned < limit:
             rec = self._read_record(off)
             if rec is None:
-                break
+                if not skip_corrupt:
+                    break
+                # Scan forward to find next valid record
+                found = False
+                probe = off + ALIGN
+                probe_scanned = ALIGN
+                while probe != s.head and probe_scanned <= scan_limit:
+                    if probe >= self.capacity:
+                        probe = DATA_START
+                    if probe == s.head:
+                        break
+                    rec2 = self._read_record(probe)
+                    if rec2 is not None:
+                        off = probe
+                        self._last_iter_skipped += 1
+                        found = True
+                        break
+                    probe += ALIGN
+                    probe_scanned += ALIGN
+                if not found:
+                    self._last_iter_skipped += 1
+                    break
+                continue
+
             kind, next_off, seq, ts_ns, obj = rec
 
             step = self._distance(off, next_off)
@@ -368,6 +503,11 @@ class SDSavior:
 
             off = next_off
 
+        # Yield any pending (not yet flushed) coalesced records
+        for obj, seq, ts_ns in self._pending:
+            if from_seq is None or seq >= from_seq:
+                yield (seq, ts_ns, obj)
+
     def export_jsonl(self, out_path: str, *, from_seq: int | None = None) -> None:
         """Write current records to a JSONL file, optionally starting from a sequence number."""
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -378,6 +518,34 @@ class SDSavior:
                 f.write(line)
 
     # ---------- internals ----------
+
+    def _sector_flush(
+        self, mm: mmap.mmap, data_fd: int, write_start: int, write_end: int,
+    ) -> None:
+        """Flush only the sector-aligned region covering [write_start, write_end)."""
+        ss = self.sector_size
+        if ss <= 0:
+            mm.flush()
+            if self.fsync_data:
+                os.fsync(data_fd)
+            return
+
+        if write_end >= write_start:
+            aligned_start = (write_start // ss) * ss
+            aligned_end = _align_up(write_end, ss)
+            length = min(aligned_end - aligned_start, self.capacity - aligned_start)
+            if length > 0:
+                mm.flush(aligned_start, length)
+        else:
+            # Wrapped around: flush tail region + head region
+            aligned_start = (write_start // ss) * ss
+            mm.flush(aligned_start, self.capacity - aligned_start)
+            aligned_end = _align_up(write_end, ss)
+            if aligned_end > 0:
+                mm.flush(0, min(aligned_end, self.capacity))
+
+        if self.fsync_data:
+            os.fsync(data_fd)
 
     def _require_open(self) -> None:
         """Ensure all runtime handles exist before operations that require an open ring."""

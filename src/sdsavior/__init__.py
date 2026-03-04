@@ -1,3 +1,4 @@
+from .aio import AsyncSDSavior
 from .ring import MetaState, SDSavior
 
-__all__ = ["SDSavior", "MetaState"]
+__all__ = ["AsyncSDSavior", "MetaState", "SDSavior"]
