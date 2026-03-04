@@ -149,14 +149,28 @@ class SDSavior:
         meta_mm: mmap.mmap | None = None
 
         try:
-            data_exists = os.path.exists(self.data_path)
-            existing_data_size = os.path.getsize(self.data_path) if data_exists else 0
-
             data_fd = os.open(self.data_path, os.O_RDWR | os.O_CREAT)
             meta_fd = os.open(self.meta_path, os.O_RDWR | os.O_CREAT)
 
-            self._ensure_file_size(data_fd, self.capacity)
-            self._ensure_file_size(meta_fd, META_FILE_SIZE)
+            data_size = os.fstat(data_fd).st_size
+            meta_size = os.fstat(meta_fd).st_size
+            is_new_data_file = data_size == 0
+
+            if data_size not in (0, self.capacity):
+                raise ValueError(
+                    f"Data file size ({data_size}) != requested capacity ({self.capacity}). "
+                    "Use the same capacity or create new files."
+                )
+            if meta_size not in (0, META_FILE_SIZE):
+                raise ValueError(
+                    f"Meta file size ({meta_size}) is invalid. "
+                    f"Expected 0 or {META_FILE_SIZE} bytes."
+                )
+
+            if is_new_data_file:
+                os.ftruncate(data_fd, self.capacity)
+            if meta_size == 0:
+                os.ftruncate(meta_fd, META_FILE_SIZE)
 
             data_mm = mmap.mmap(data_fd, self.capacity, access=mmap.ACCESS_WRITE)
             meta_mm = mmap.mmap(meta_fd, META_FILE_SIZE, access=mmap.ACCESS_WRITE)
@@ -170,12 +184,12 @@ class SDSavior:
             data_mm = None
             meta_mm = None
 
-            if existing_data_size > 0 and self._data_mm[:DATA_START] != DATA_MAGIC:
+            if not is_new_data_file and self._data_mm[:DATA_START] != DATA_MAGIC:
                 raise ValueError(
                     f"Data file {self.data_path!r} has invalid magic; "
                     "refusing to overwrite existing data."
                 )
-            if existing_data_size == 0 and self._data_mm[:DATA_START] != DATA_MAGIC:
+            if is_new_data_file:
                 self._data_mm[:DATA_START] = DATA_MAGIC
                 self._data_mm.flush()
                 if self.fsync_data:
@@ -215,28 +229,29 @@ class SDSavior:
 
     def close(self) -> None:
         """Persist metadata and release mmap/file descriptors."""
-        if self._state is not None:
-            self._write_meta(self._state)
+        try:
+            if self._state is not None:
+                self._write_meta(self._state)
+        finally:
+            if self._data_mm is not None:
+                self._data_mm.flush()
+                self._data_mm.close()
+                self._data_mm = None
 
-        if self._data_mm is not None:
-            self._data_mm.flush()
-            self._data_mm.close()
-            self._data_mm = None
+            if self._meta_mm is not None:
+                self._meta_mm.flush()
+                self._meta_mm.close()
+                self._meta_mm = None
 
-        if self._meta_mm is not None:
-            self._meta_mm.flush()
-            self._meta_mm.close()
-            self._meta_mm = None
+            if self._data_fd is not None:
+                os.close(self._data_fd)
+                self._data_fd = None
 
-        if self._data_fd is not None:
-            os.close(self._data_fd)
-            self._data_fd = None
+            if self._meta_fd is not None:
+                os.close(self._meta_fd)
+                self._meta_fd = None
 
-        if self._meta_fd is not None:
-            os.close(self._meta_fd)
-            self._meta_fd = None
-
-        self._state = None
+            self._state = None
 
     def _cleanup_open_handles(self) -> None:
         """Best-effort cleanup of mapped files and fds without persisting metadata."""
@@ -331,7 +346,7 @@ class SDSavior:
 
         off = s.tail
         scanned = 0
-        limit = self.recover_scan_limit_bytes or self.capacity
+        limit = self.capacity
 
         while off != s.head and scanned < limit:
             rec = self._read_record(off)
@@ -339,7 +354,10 @@ class SDSavior:
                 break
             kind, next_off, seq, ts_ns, obj = rec
 
-            scanned += self._distance(off, next_off)
+            step = self._distance(off, next_off)
+            if step <= 0:
+                break
+            scanned += step
 
             if kind == "wrap":
                 off = next_off
@@ -405,6 +423,8 @@ class SDSavior:
 
         (total_len,) = struct.unpack_from("<I", mm, off)
         if total_len == WRAP_MARKER:
+            if off == DATA_START:
+                return None
             return ("wrap", DATA_START, 0, 0, None)
 
         if total_len < RECORD_HDR_SIZE or total_len > self.capacity:
@@ -579,14 +599,22 @@ class SDSavior:
                 break
 
             kind, next_off, seq, _ts_ns, _obj = rec
+            step = self._distance(off, next_off)
+            if step <= 0:
+                s.head = last_good_off
+                s.commit += 1
+                self._write_meta(s)
+                truncated = True
+                break
+
             if kind == "wrap":
-                scanned += self._distance(off, next_off)
+                scanned += step
                 off = next_off
                 last_good_off = off
                 continue
 
             last_seq = seq
-            scanned += self._distance(off, next_off)
+            scanned += step
             off = next_off
             last_good_off = off
 

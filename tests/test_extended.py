@@ -161,13 +161,16 @@ def test_open_rejects_capacity_mismatch(tmp_path: Path) -> None:
     """Reject opening existing files when requested capacity does not match meta."""
     data = tmp_path / "ring.dat"
     meta = tmp_path / "ring.meta"
+    original_capacity = 256 * 1024
 
-    with SDSavior(str(data), str(meta), 256 * 1024) as rb:
+    with SDSavior(str(data), str(meta), original_capacity) as rb:
         rb.append({"n": 1})
 
-    with pytest.raises(ValueError, match="Meta capacity"):
+    size_before = data.stat().st_size
+    with pytest.raises(ValueError, match="Data file size"):
         with SDSavior(str(data), str(meta), 16 * 1024) as rb2:
             rb2.iter_records()
+    assert data.stat().st_size == size_before
 
 
 def test_open_twice_requires_close(tmp_path: Path) -> None:
@@ -259,6 +262,50 @@ def test_open_cleans_up_handles_when_internal_error_occurs(
 
     with pytest.raises(RuntimeError, match="forced load_meta failure"):
         rb.open()
+
+    assert rb._data_fd is None
+    assert rb._meta_fd is None
+    assert rb._data_mm is None
+    assert rb._meta_mm is None
+    assert rb._state is None
+
+
+def test_recover_treats_wrap_marker_at_data_start_as_corruption(tmp_path: Path) -> None:
+    """Ensure wrap markers at DATA_START do not cause recovery/iteration hangs."""
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+    capacity = 256 * 1024
+
+    with SDSavior(str(data), str(meta), capacity) as rb:
+        rb.append({"n": 1})
+
+    with SDSavior(str(data), str(meta), capacity) as rb:
+        assert rb._data_mm is not None
+        struct.pack_into("<I", rb._data_mm, 4, 0xFFFFFFFF)
+        rb._data_mm.flush()
+
+    with SDSavior(str(data), str(meta), capacity) as rb2:
+        assert list(rb2.iter_records()) == []
+
+
+def test_close_cleans_up_handles_when_meta_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ensure close releases resources even if metadata persistence raises."""
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+    rb = SDSavior(str(data), str(meta), 256 * 1024)
+    rb.open()
+
+    def raise_on_write_meta(_st) -> None:
+        """Force close() to execute cleanup via the finally branch."""
+        raise RuntimeError("forced write_meta failure")
+
+    monkeypatch.setattr(rb, "_write_meta", raise_on_write_meta)
+
+    with pytest.raises(RuntimeError, match="forced write_meta failure"):
+        rb.close()
 
     assert rb._data_fd is None
     assert rb._meta_fd is None

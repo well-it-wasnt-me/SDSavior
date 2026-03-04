@@ -72,10 +72,12 @@ def test_open_rejects_existing_invalid_magic(tmp_path: Path) -> None:
 
     data.write_bytes(b"BAD!" + b"\x00" * (capacity - 4))
     meta.write_bytes(b"")
+    size_before = data.stat().st_size
 
     rb = SDSavior(str(data), str(meta), capacity)
     with pytest.raises(ValueError, match="invalid magic"):
         rb.open()
+    assert data.stat().st_size == size_before
 
 
 def test_recover_truncates_when_scan_limit_is_reached(tmp_path: Path) -> None:
@@ -92,6 +94,23 @@ def test_recover_truncates_when_scan_limit_is_reached(tmp_path: Path) -> None:
     with SDSavior(str(data), str(meta), capacity, recover_scan_limit_bytes=1) as rb_limited:
         rows = list(rb_limited.iter_records())
         assert [r[2]["n"] for r in rows] == [1]
+
+
+def test_iter_records_ignores_recover_scan_limit_after_open(tmp_path: Path) -> None:
+    """Ensure iteration is not implicitly capped by recovery-only scan limits."""
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+    capacity = 256 * 1024
+
+    with SDSavior(str(data), str(meta), capacity) as rb:
+        rb.append({"n": 1})
+        rb.append({"n": 2})
+        rb.append({"n": 3})
+
+    with SDSavior(str(data), str(meta), capacity) as rb2:
+        rb2.recover_scan_limit_bytes = 1
+        rows = list(rb2.iter_records())
+        assert [r[2]["n"] for r in rows] == [1, 2, 3]
 
 
 def test_write_wrap_marker_fsyncs_data_when_enabled(
