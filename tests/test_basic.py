@@ -52,6 +52,15 @@ def test_capacity_must_be_aligned(tmp_path: Path) -> None:
         SDSavior(str(data), str(meta), (16 * 1024) + 1)
 
 
+def test_capacity_too_small_raises(tmp_path: Path) -> None:
+    """Reject capacities that are too small to be useful."""
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with pytest.raises(ValueError, match="too small"):
+        SDSavior(str(data), str(meta), 8 * 1024)
+
+
 def test_json_kwargs_are_copied(tmp_path: Path) -> None:
     """Ensure caller-owned JSON kwargs are copied, not referenced."""
     data = tmp_path / "ring.dat"
@@ -111,6 +120,25 @@ def test_iter_records_ignores_recover_scan_limit_after_open(tmp_path: Path) -> N
         rb2.recover_scan_limit_bytes = 1
         rows = list(rb2.iter_records())
         assert [r[2]["n"] for r in rows] == [1, 2, 3]
+
+
+def test_append_fsyncs_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify append calls fsync when data syncing is enabled."""
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+    fsync_calls: list[int] = []
+
+    def fake_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+
+    monkeypatch.setattr("sdsavior.ring.os.fsync", fake_fsync)
+
+    with SDSavior(str(data), str(meta), 16 * 1024, fsync_data=True, fsync_meta=False) as rb:
+        assert rb._data_fd is not None
+        data_fd = rb._data_fd
+        fsync_calls.clear()
+        rb.append({"n": 1})
+        assert fsync_calls == [data_fd]
 
 
 def test_write_wrap_marker_fsyncs_data_when_enabled(

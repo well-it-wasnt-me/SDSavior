@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from sdsavior import SDSavior, cli
-from sdsavior.ring import RECORD_HDR, RECORD_HDR_SIZE, _crc32_bytes
+from sdsavior.ring import (
+    DATA_START,
+    META_FILE_SIZE,
+    RECORD_HDR,
+    RECORD_HDR_SIZE,
+    WRAP_MARKER,
+    MetaState,
+    _crc32_bytes,
+)
 
 
 def _record_offsets(rb: SDSavior) -> list[int]:
@@ -268,6 +278,210 @@ def test_open_cleans_up_handles_when_internal_error_occurs(
     assert rb._data_mm is None
     assert rb._meta_mm is None
     assert rb._state is None
+
+
+def test_open_rejects_invalid_meta_size(tmp_path: Path) -> None:
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+    capacity = 16 * 1024
+
+    with open(data, "wb") as f:
+        f.truncate(capacity)
+    with open(meta, "wb") as f:
+        f.truncate(1)
+
+    rb = SDSavior(str(data), str(meta), capacity)
+    with pytest.raises(ValueError, match="Meta file size"):
+        rb.open()
+
+
+def test_open_rejects_meta_capacity_mismatch(tmp_path: Path) -> None:
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+    capacity = 32 * 1024
+
+    with SDSavior(str(data), str(meta), capacity) as rb:
+        rb.append({"n": 1})
+
+    other_capacity = 16 * 1024
+    state = MetaState(
+        capacity=other_capacity,
+        head=DATA_START,
+        tail=DATA_START,
+        seq_next=1,
+        commit=1,
+    )
+    raw = rb._pack_meta(state)
+    meta.write_bytes(raw + b"\x00" * (META_FILE_SIZE - len(raw)))
+
+    rb2 = SDSavior(str(data), str(meta), capacity)
+    with pytest.raises(ValueError, match="Meta capacity"):
+        rb2.open()
+
+
+def test_iter_records_breaks_on_corrupt_record(tmp_path: Path) -> None:
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with SDSavior(str(data), str(meta), 16 * 1024) as rb:
+        rb.append({"n": 1})
+        assert rb._data_mm is not None
+        struct.pack_into("<I", rb._data_mm, DATA_START, 0)
+        assert list(rb.iter_records()) == []
+
+
+def test_iter_records_handles_wrap_marker(tmp_path: Path) -> None:
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with SDSavior(str(data), str(meta), 16 * 1024) as rb:
+        assert rb._state is not None
+        off = DATA_START + 64
+        rb._write_wrap_marker(off)
+        rb._state.tail = off
+        rb._state.head = DATA_START
+        assert list(rb.iter_records()) == []
+
+
+def test_read_record_invalid_cases(tmp_path: Path) -> None:
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with SDSavior(str(data), str(meta), 16 * 1024) as rb:
+        assert rb._data_mm is not None
+        mm = rb._data_mm
+
+        assert rb._read_record(0) is None
+
+        struct.pack_into("<I", mm, DATA_START, WRAP_MARKER)
+        assert rb._read_record(DATA_START) is None
+
+        struct.pack_into("<I", mm, DATA_START, 0)
+        assert rb._read_record(DATA_START) is None
+
+        off = rb.capacity - DATA_START
+        struct.pack_into("<I", mm, off, RECORD_HDR_SIZE)
+        assert rb._read_record(off) is None
+
+        RECORD_HDR.pack_into(
+            mm,
+            DATA_START,
+            RECORD_HDR_SIZE,
+            0,
+            1,
+            1,
+            8,
+            0,
+        )
+        assert rb._read_record(DATA_START) is None
+
+
+def test_ensure_file_size_expands(tmp_path: Path) -> None:
+    path = tmp_path / "size.dat"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT)
+    try:
+        SDSavior._ensure_file_size(fd, 128)
+        assert os.fstat(fd).st_size == 128
+    finally:
+        os.close(fd)
+
+
+def test_unpack_meta_rejects_invalid_buffers(tmp_path: Path) -> None:
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+    rb = SDSavior(str(data), str(meta), 16 * 1024)
+
+    assert rb._unpack_meta(b"short") is None
+
+    state = MetaState(
+        capacity=rb.capacity,
+        head=DATA_START,
+        tail=DATA_START,
+        seq_next=1,
+        commit=1,
+    )
+    raw = rb._pack_meta(state)
+    corrupt_crc = bytearray(raw)
+    corrupt_crc[-8] ^= 0xFF
+    assert rb._unpack_meta(bytes(corrupt_crc)) is None
+
+    bad_state = MetaState(
+        capacity=rb.capacity,
+        head=0,
+        tail=0,
+        seq_next=1,
+        commit=1,
+    )
+    bad_raw = rb._pack_meta(bad_state)
+    assert rb._unpack_meta(bad_raw) is None
+
+
+def test_make_space_handles_corrupt_tail_record(tmp_path: Path) -> None:
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with SDSavior(str(data), str(meta), 16 * 1024) as rb:
+        rb.append({"n": 1})
+        assert rb._state is not None
+        assert rb._data_mm is not None
+        struct.pack_into("<I", rb._data_mm, rb._state.tail, 0)
+        rb._make_space((rb.capacity - DATA_START) + 8)
+        assert rb._state.tail == rb._state.head
+
+
+def test_recover_handles_non_advancing_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with SDSavior(str(data), str(meta), 16 * 1024) as rb:
+        rb.append({"n": 1})
+        assert rb._state is not None
+        start_commit = rb._state.commit
+
+        def stuck(_off: int):
+            return ("rec", _off, 1, 0, {})
+
+        monkeypatch.setattr(rb, "_read_record", stuck)
+        rb._recover()
+        assert rb._state.commit == start_commit + 1
+        assert rb._state.head == rb._state.tail
+
+
+def test_recover_wrap_marker_advances(tmp_path: Path) -> None:
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with SDSavior(str(data), str(meta), 16 * 1024) as rb:
+        assert rb._state is not None
+        off = DATA_START + 64
+        rb._write_wrap_marker(off)
+        rb._state.tail = off
+        rb._state.head = DATA_START
+        rb._recover()
+        assert rb._state.tail == off
+        assert rb._state.head == DATA_START
+
+
+def test_recover_updates_seq_next(tmp_path: Path) -> None:
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with SDSavior(str(data), str(meta), 16 * 1024) as rb:
+        rb.append({"n": 1})
+        last_seq = rb.append({"n": 2})
+        assert rb._state is not None
+        rb._state.seq_next = 1
+        rb._recover()
+        assert rb._state.seq_next == last_seq + 1
+
+
+def test_cli_returns_nonzero_for_unknown_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli.argparse.ArgumentParser,
+        "parse_args",
+        lambda _self: SimpleNamespace(cmd="noop"),
+    )
+    assert cli.main() == 2
 
 
 def test_recover_treats_wrap_marker_at_data_start_as_corruption(tmp_path: Path) -> None:
