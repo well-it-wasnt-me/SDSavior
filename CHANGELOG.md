@@ -2,6 +2,24 @@
 
 <!-- version list -->
 
+## v1.0.2 (2026-03-04)
+
+### Bug Fixes
+
+- **ci**: Pypy with twine
+  ([`f4bd2c2`](https://github.com/well-it-wasnt-me/SDSavior/commit/f4bd2c2833b42478fb15be6ac2b63a7a17ee7250))
+
+### Chores
+
+- Line to long
+  ([`fd9e506`](https://github.com/well-it-wasnt-me/SDSavior/commit/fd9e5069ff4e5c79ca96b8e2ab320de1d3c36bd9))
+
+### Testing
+
+- **coverage**: Extended test coverage
+  ([`3f0b76a`](https://github.com/well-it-wasnt-me/SDSavior/commit/3f0b76a922c79593ce877fbf91df6e27dd98bff5))
+
+
 ## v1.0.1 (2026-03-04)
 
 ### Bug Fixes
