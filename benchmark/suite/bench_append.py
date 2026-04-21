@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from tqdm import tqdm
+
 from sdsavior import SDSavior
 
 
@@ -44,7 +45,10 @@ def parse_args() -> argparse.Namespace:
         action="append",
         choices=["none", "meta_only", "full_fsync"],
         default=["none", "meta_only", "full_fsync"],
-        help="none=file/mmap no fsync, meta_only=sdsavior only, full_fsync=all backends fsync/msync",
+        help=(
+            "none=file/mmap no fsync, meta_only=sdsavior only, "
+            "full_fsync=all backends fsync/msync"
+        ),
     )
     parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument("--markdown-out", type=Path, default=None)
@@ -108,8 +112,7 @@ class SDSaviorWriter(BaseWriter):
         self._rb.open()
 
     def append_bytes(self, data: bytes) -> None:
-        payload = json.loads(data.decode("utf-8"))
-        self._rb.append(payload)
+        self._rb.append_json_bytes(data)
 
     def close(self) -> None:
         close = getattr(self._rb, "close", None)
@@ -145,7 +148,9 @@ class MmapWriter(BaseWriter):
         line = data + b"\n"
         needed = len(line)
         if needed > self._capacity_bytes:
-            raise ValueError(f"Record of {needed} bytes exceeds mmap capacity {self._capacity_bytes}")
+            raise ValueError(
+                f"Record of {needed} bytes exceeds mmap capacity {self._capacity_bytes}"
+            )
         if self._pos + needed > self._capacity_bytes:
             self._pos = 0
         self._mm[self._pos:self._pos + needed] = line
@@ -158,7 +163,12 @@ class MmapWriter(BaseWriter):
         self._f.close()
 
 
-def create_writer(tmpdir: Path, backend: str, capacity_bytes: int, durability_mode: str) -> BaseWriter:
+def create_writer(
+    tmpdir: Path,
+    backend: str,
+    capacity_bytes: int,
+    durability_mode: str,
+) -> BaseWriter:
     if backend == "sdsavior":
         return SDSaviorWriter(
             data_path=tmpdir / "data.ring",
@@ -169,7 +179,11 @@ def create_writer(tmpdir: Path, backend: str, capacity_bytes: int, durability_mo
     if backend == "file":
         return FileWriter(tmpdir / "data.jsonl", durability_mode=durability_mode)
     if backend == "mmap":
-        return MmapWriter(tmpdir / "data.mmap", capacity_bytes=capacity_bytes, durability_mode=durability_mode)
+        return MmapWriter(
+            tmpdir / "data.mmap",
+            capacity_bytes=capacity_bytes,
+            durability_mode=durability_mode,
+        )
     raise ValueError(f"Unknown backend: {backend}")
 
 
@@ -179,7 +193,12 @@ def is_supported_combo(backend: str, durability_mode: str) -> bool:
     return durability_mode in {"none", "full_fsync"}
 
 
-def append_n(writer: BaseWriter, n_records: int, payload_size: int, desc: str) -> tuple[list[float], int]:
+def append_n(
+    writer: BaseWriter,
+    n_records: int,
+    payload_size: int,
+    desc: str,
+) -> tuple[list[float], int]:
     latencies_us: list[float] = []
     total_bytes = 0
 
@@ -209,14 +228,20 @@ def run_once(
     tmpdir = Path(tempfile.mkdtemp(prefix=f"sdsavior-bench-{backend}-"))
 
     try:
-        writer = create_writer(tmpdir=tmpdir, backend=backend, capacity_bytes=capacity_bytes, durability_mode=durability_mode)
+        writer = create_writer(
+            tmpdir=tmpdir,
+            backend=backend,
+            capacity_bytes=capacity_bytes,
+            durability_mode=durability_mode,
+        )
         try:
             start = time.perf_counter()
+            run_label = "warmup" if warmup else f"run{run_index + 1}"
             latencies_us, total_bytes = append_n(
                 writer,
                 n_records=n_records,
                 payload_size=payload_size,
-                desc=f"{backend} {payload_size}B {durability_mode} {'warmup' if warmup else f'run{run_index + 1}'}",
+                desc=f"{backend} {payload_size}B {durability_mode} {run_label}",
             )
             end = time.perf_counter()
         finally:
@@ -276,7 +301,8 @@ def markdown_table(summary_rows: list[dict[str, Any]]) -> str:
     lines = [
         "# Append benchmark summary",
         "",
-        "| backend | capacity (MiB) | payload (B) | durability | runs | rec/s | MB/s | p50 us | p95 us | p99 us |",
+        "| backend | capacity (MiB) | payload (B) | durability | runs | rec/s | "
+        "MB/s | p50 us | p95 us | p99 us |",
         "|---|---:|---:|---|---:|---:|---:|---:|---:|---:|",
     ]
     for row in summary_rows:
@@ -309,7 +335,10 @@ def main() -> None:
         if is_supported_combo(backend, durability_mode)
     ]
 
-    for backend, capacity_mib, payload_size, durability_mode in tqdm(scenarios, desc="Append scenarios"):
+    for backend, capacity_mib, payload_size, durability_mode in tqdm(
+        scenarios,
+        desc="Append scenarios",
+    ):
         for warmup_index in range(args.warmups):
             row = run_once(
                 backend=backend,

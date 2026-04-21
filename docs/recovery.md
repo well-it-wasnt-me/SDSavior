@@ -28,6 +28,7 @@ Each slot stores:
 - ring capacity
 - `head`, `tail`, `seq_next`
 - `commit`
+- recovery checkpoint offset
 - `crc32`
 
 On load, the newest valid slot (highest commit) is used.
@@ -37,9 +38,13 @@ On load, the newest valid slot (highest commit) is used.
 On `open()`:
 
 1. Load the newest valid metadata slot.
-2. Scan records from `tail` toward `head`.
+2. Scan records from the recovery checkpoint, or from `tail` when no checkpoint is trusted.
 3. Stop and truncate `head` at the last valid offset if corruption is found.
 4. If scan limit is reached before `head`, truncate at last validated offset.
 5. Adjust `seq_next` if needed.
 
 This keeps unreadable partial writes out of normal iteration.
+
+`fsync_data=True` advances the checkpoint after each durable append. The optional
+`recovery_checkpoint_interval_records` setting can also create periodic checkpoints
+by flushing data pages and storing the current `head`.

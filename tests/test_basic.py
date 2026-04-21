@@ -29,6 +29,20 @@ def test_append_and_iter(tmp_path: Path) -> None:
         rb.close()
 
 
+def test_append_json_bytes_and_iter(tmp_path: Path) -> None:
+    """Verify already-encoded JSON can be appended without object serialization."""
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with SDSavior(str(data), str(meta), 256 * 1024) as rb:
+        seq = rb.append_json_bytes(b'{"n":1}')
+        rows = list(rb.iter_records())
+
+    assert len(rows) == 1
+    assert rows[0][0] == seq
+    assert rows[0][2] == {"n": 1}
+
+
 def test_reopen_recovers(tmp_path: Path) -> None:
     """Verify records remain readable after closing and reopening files."""
     data = tmp_path / "ring.dat"
@@ -59,6 +73,20 @@ def test_capacity_too_small_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="too small"):
         SDSavior(str(data), str(meta), 8 * 1024)
+
+
+def test_recovery_checkpoint_interval_must_be_positive(tmp_path: Path) -> None:
+    """Reject non-positive recovery checkpoint intervals."""
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with pytest.raises(ValueError, match="checkpoint"):
+        SDSavior(
+            str(data),
+            str(meta),
+            256 * 1024,
+            recovery_checkpoint_interval_records=0,
+        )
 
 
 def test_json_kwargs_are_copied(tmp_path: Path) -> None:

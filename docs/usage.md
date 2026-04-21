@@ -21,6 +21,13 @@ with SDSavior("data.ring", "data.meta", 8 * 1024 * 1024) as rb:
     rb.append({"ok": True})
 ```
 
+If the record is already serialized as compact JSON, append the bytes directly:
+
+```python
+with SDSavior("data.ring", "data.meta", 8 * 1024 * 1024) as rb:
+    rb.append_json_bytes(b'{"ok":true}')
+```
+
 ## Read Records
 
 ```python
@@ -47,5 +54,6 @@ with SDSavior("data.ring", "data.meta", 8 * 1024 * 1024) as rb:
 - `fsync_meta=True` (default): metadata is `fsync`'d after writes.
 - `fsync_data=False` (default): data pages are not `fsync`'d on every append.
 - `recover_scan_limit_bytes=None` (default): scan up to capacity during recovery.
+- `recovery_checkpoint_interval_records=None` (default): do not add periodic recovery checkpoints.
 
 Use `fsync_data=True` when stronger durability is required and throughput tradeoffs are acceptable.

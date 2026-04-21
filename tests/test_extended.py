@@ -364,6 +364,35 @@ def test_meta_double_buffer_keeps_previous_valid_slot(tmp_path: Path) -> None:
             rb._meta_mm[latest_start] = original
 
 
+def test_full_fsync_advances_recovery_checkpoint(tmp_path: Path) -> None:
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with SDSavior(str(data), str(meta), 16 * 1024, fsync_data=True, fsync_meta=False) as rb:
+        rb.append({"n": 1})
+        assert rb._state is not None
+        assert rb._state.recover_start == rb._state.head
+
+
+def test_recovery_checkpoint_interval_advances_checkpoint(tmp_path: Path) -> None:
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with SDSavior(
+        str(data),
+        str(meta),
+        16 * 1024,
+        fsync_meta=False,
+        recovery_checkpoint_interval_records=2,
+    ) as rb:
+        rb.append({"n": 1})
+        assert rb._state is not None
+        assert rb._state.recover_start == rb._state.tail
+
+        rb.append({"n": 2})
+        assert rb._state.recover_start == rb._state.head
+
+
 def test_iter_records_breaks_on_corrupt_record(tmp_path: Path) -> None:
     data = tmp_path / "ring.dat"
     meta = tmp_path / "ring.meta"

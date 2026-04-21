@@ -71,19 +71,24 @@ def summarize_recovery(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return summary
 
 
-def render_report(append_summary: list[dict[str, Any]], recovery_summary: list[dict[str, Any]]) -> str:
+def render_report(
+    append_summary: list[dict[str, Any]],
+    recovery_summary: list[dict[str, Any]],
+) -> str:
     lines: list[str] = [
         "# Benchmarks",
         "",
         "## Append",
         "",
-        "| backend | capacity (MiB) | payload (B) | durability | rec/s | MB/s | p50 us | p95 us | p99 us |",
+        "| backend | capacity (MiB) | payload (B) | durability | rec/s | "
+        "MB/s | p50 us | p95 us | p99 us |",
         "|---|---:|---:|---|---:|---:|---:|---:|---:|",
     ]
     for row in append_summary:
         lines.append(
             "| {backend} | {capacity_mib} | {payload_bytes} | {durability_mode} | "
-            "{records_per_sec:.0f} | {mb_per_sec:.2f} | {p50_us:.1f} | {p95_us:.1f} | {p99_us:.1f} |".format(**row)
+            "{records_per_sec:.0f} | {mb_per_sec:.2f} | {p50_us:.1f} | "
+            "{p95_us:.1f} | {p99_us:.1f} |".format(**row)
         )
 
     lines.extend([
@@ -95,7 +100,8 @@ def render_report(append_summary: list[dict[str, Any]], recovery_summary: list[d
     ])
     for row in recovery_summary:
         lines.append(
-            "| {backend} | {capacity_mib} | {durability_mode} | {recovery_ms:.2f} | {recovered_records_mean:.0f} |".format(**row)
+            "| {backend} | {capacity_mib} | {durability_mode} | "
+            "{recovery_ms:.2f} | {recovered_records_mean:.0f} |".format(**row)
         )
 
     lines.extend([

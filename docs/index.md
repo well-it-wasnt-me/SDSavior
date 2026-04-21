@@ -7,7 +7,7 @@ It is designed for durability and/or sensitive environments where the life of an
 
 - Fixed-size data file with ring semantics.
 - Double-buffered metadata with CRC and commit counter.
-- Crash recovery that validates record headers, CRC, and payload decoding.
+- Crash recovery that validates record headers, CRC, and payload decoding from safe checkpoints.
 - Optional data `fsync` and metadata `fsync` controls.
 
 ## Quick Start

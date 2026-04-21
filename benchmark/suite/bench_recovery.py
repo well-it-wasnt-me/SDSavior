@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import mmap
 import os
 import platform
 import shutil
@@ -28,8 +27,8 @@ from pathlib import Path
 from typing import Any
 
 from tqdm import tqdm
-from sdsavior import SDSavior
 
+from sdsavior import SDSavior
 
 WRITER_CODE = r"""
 import json
@@ -80,8 +79,7 @@ if backend == "sdsavior":
 
     i = 0
     while True:
-        payload = json.loads(record(i).decode("utf-8"))
-        rb.append(payload)
+        rb.append_json_bytes(record(i))
         i += 1
 
 elif backend == "file":
@@ -169,7 +167,13 @@ def count_mmap_records(path: Path) -> int:
     return count
 
 
-def recover(backend: str, data_path: Path, meta_path: Path, capacity_bytes: int, durability_mode: str) -> tuple[int, float]:
+def recover(
+    backend: str,
+    data_path: Path,
+    meta_path: Path,
+    capacity_bytes: int,
+    durability_mode: str,
+) -> tuple[int, float]:
     t0 = time.perf_counter()
 
     if backend == "sdsavior":
@@ -214,7 +218,13 @@ def recover(backend: str, data_path: Path, meta_path: Path, capacity_bytes: int,
     return recovered, t1 - t0
 
 
-def run_once(backend: str, capacity_mib: int, durability_mode: str, run_index: int, kill_after_seconds: float) -> dict[str, Any]:
+def run_once(
+    backend: str,
+    capacity_mib: int,
+    durability_mode: str,
+    run_index: int,
+    kill_after_seconds: float,
+) -> dict[str, Any]:
     capacity_bytes = capacity_mib * 1024 * 1024
     tmpdir = Path(tempfile.mkdtemp(prefix=f"sdsavior-bench-recovery-{backend}-"))
     data_path = tmpdir / "data.bin"
@@ -289,13 +299,15 @@ def markdown_table(summary_rows: list[dict[str, Any]]) -> str:
     lines = [
         "# Recovery benchmark summary",
         "",
-        "| backend | capacity (MiB) | durability | runs | recovery ms | recovered records mean | recovered records min | recovered records max |",
+        "| backend | capacity (MiB) | durability | runs | recovery ms | "
+        "recovered records mean | recovered records min | recovered records max |",
         "|---|---:|---|---:|---:|---:|---:|---:|",
     ]
     for row in summary_rows:
         lines.append(
-            "| {backend} | {capacity_mib} | {durability_mode} | {runs} | {recovery_ms_mean:.2f} | "
-            "{recovered_records_mean:.0f} | {recovered_records_min} | {recovered_records_max} |".format(**row)
+            "| {backend} | {capacity_mib} | {durability_mode} | {runs} | "
+            "{recovery_ms_mean:.2f} | {recovered_records_mean:.0f} | "
+            "{recovered_records_min} | {recovered_records_max} |".format(**row)
         )
     lines.extend([
         "",

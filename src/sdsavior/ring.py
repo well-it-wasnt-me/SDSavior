@@ -71,6 +71,7 @@ class MetaState:
     tail: int
     seq_next: int
     commit: int
+    recover_start: int = DATA_START
 
 
 class SDSavior:
@@ -99,6 +100,7 @@ class SDSavior:
         fsync_meta: bool = True,
         json_dumps_kwargs: dict[str, Any] | None = None,
         recover_scan_limit_bytes: int | None = None,
+        recovery_checkpoint_interval_records: int | None = None,
     ):
         """Configure file paths, durability options, and recovery behavior for a ring instance."""
         capacity = int(capacity_bytes)
@@ -106,6 +108,11 @@ class SDSavior:
             raise ValueError("capacity_bytes is too small to be useful.")
         if capacity % ALIGN != 0:
             raise ValueError(f"capacity_bytes must be a multiple of {ALIGN}.")
+        if (
+            recovery_checkpoint_interval_records is not None
+            and recovery_checkpoint_interval_records <= 0
+        ):
+            raise ValueError("recovery_checkpoint_interval_records must be positive.")
 
         self.data_path = data_path
         self.meta_path = meta_path
@@ -126,6 +133,7 @@ class SDSavior:
         encoder_kwargs: Any = {k: v for k, v in self.json_dumps_kwargs.items() if k != "cls"}
         self._json_encoder = encoder_cls(**encoder_kwargs)
         self.recover_scan_limit_bytes = recover_scan_limit_bytes
+        self.recovery_checkpoint_interval_records = recovery_checkpoint_interval_records
 
         self._data_fd: int | None = None
         self._meta_fd: int | None = None
@@ -133,6 +141,7 @@ class SDSavior:
         self._meta_mm: mmap.mmap | None = None
         self._state: MetaState | None = None
         self._current_meta_slot: int | None = None
+        self._records_since_recovery_checkpoint = 0
 
     def __enter__(self) -> SDSavior:
         """Open the ring buffer when entering a ``with`` block."""
@@ -213,6 +222,7 @@ class SDSavior:
                     tail=DATA_START,
                     seq_next=1,
                     commit=1,
+                    recover_start=DATA_START,
                 )
                 self._write_meta(self._state)
             else:
@@ -242,6 +252,10 @@ class SDSavior:
         """Persist metadata and release mmap/file descriptors."""
         try:
             if self._state is not None:
+                if self._data_mm is not None:
+                    self._data_mm.flush()
+                    if self.fsync_data or self.recovery_checkpoint_interval_records is not None:
+                        self._state.recover_start = self._state.head
                 self._write_meta(self._state)
         finally:
             if self._data_mm is not None:
@@ -264,6 +278,7 @@ class SDSavior:
 
             self._state = None
             self._current_meta_slot = None
+            self._records_since_recovery_checkpoint = 0
 
     def _cleanup_open_handles(self) -> None:
         """Best-effort cleanup of mapped files and fds without persisting metadata."""
@@ -285,12 +300,30 @@ class SDSavior:
 
         self._state = None
         self._current_meta_slot = None
+        self._records_since_recovery_checkpoint = 0
 
     def append(self, obj: Any) -> int:
         """
         Append a JSON object. Returns the sequence number written.
         Overwrites oldest records if needed.
         """
+        payload = (self._json_encoder.encode(obj) + "\n").encode("utf-8")
+        return self._append_payload(payload)
+
+    def append_json_bytes(self, data: bytes | bytearray | memoryview) -> int:
+        """
+        Append an already-serialized JSON record and return its sequence number.
+
+        This avoids a JSON decode/encode round trip for callers that already have
+        compact UTF-8 JSON bytes. A trailing newline is added when absent.
+        """
+        payload = bytes(data)
+        if not payload.endswith(b"\n"):
+            payload += b"\n"
+        return self._append_payload(payload)
+
+    def _append_payload(self, payload: bytes) -> int:
+        """Append one UTF-8 JSON-line payload to the ring."""
         self._require_open()
         assert self._state is not None
         assert self._data_mm is not None
@@ -299,7 +332,6 @@ class SDSavior:
         mm = self._data_mm
         data_fd = self._data_fd
 
-        payload = (self._json_encoder.encode(obj) + "\n").encode("utf-8")
         payload_len = len(payload)
         total_len = _align_up(RECORD_HDR_SIZE + payload_len, ALIGN)
 
@@ -345,6 +377,21 @@ class SDSavior:
         if self.fsync_data:
             self._flush_data_range(head, total_len)
             os.fsync(data_fd)
+            s.recover_start = s.head
+            self._records_since_recovery_checkpoint = 0
+        elif self.recovery_checkpoint_interval_records is not None:
+            self._records_since_recovery_checkpoint += 1
+            if (
+                self._records_since_recovery_checkpoint
+                >= self.recovery_checkpoint_interval_records
+            ):
+                mm.flush()
+                s.recover_start = s.head
+                self._records_since_recovery_checkpoint = 0
+            else:
+                self._normalize_recover_start()
+        else:
+            self._normalize_recover_start()
 
         self._write_meta(s)
 
@@ -545,6 +592,29 @@ class SDSavior:
         s = self._state
         return self._distance(s.tail, s.head)
 
+    def _offset_in_live_range(self, off: int) -> bool:
+        """Return whether ``off`` lies on the current tail-to-head path."""
+        assert self._state is not None
+        s = self._state
+        if not (DATA_START <= off < self.capacity):
+            return False
+        if s.tail <= s.head:
+            return s.tail <= off <= s.head
+        return off >= s.tail or off <= s.head
+
+    def _normalize_recover_start(self) -> None:
+        """Keep the recovery checkpoint inside the live ring region."""
+        assert self._state is not None
+        s = self._state
+        if not self._offset_in_live_range(s.recover_start):
+            s.recover_start = s.tail
+
+    def _recover_scan_start(self) -> int:
+        """Choose where recovery should begin validating records."""
+        assert self._state is not None
+        self._normalize_recover_start()
+        return self._state.recover_start
+
     def _make_space(self, need: int) -> None:
         """Advance tail until at least ``need`` bytes are free for a new record."""
         assert self._state is not None
@@ -615,7 +685,7 @@ class SDSavior:
 
     def _pack_meta(self, st: MetaState) -> bytes:
         """Serialize metadata state with CRC for durable double-buffered commits."""
-        reserved = 0
+        reserved = st.recover_start
         crc_placeholder = 0
         pad = 0
         raw = META_HDR.pack(
@@ -639,7 +709,7 @@ class SDSavior:
             st.tail,
             st.seq_next,
             st.commit,
-            reserved,
+            st.recover_start,
             crc,
             pad,
         )
@@ -656,7 +726,17 @@ class SDSavior:
             return None
         if not (DATA_START <= head < cap and DATA_START <= tail < cap):
             return None
-        return MetaState(capacity=cap, head=head, tail=tail, seq_next=seq_next, commit=commit)
+        recover_start = reserved or tail
+        if not (DATA_START <= recover_start < cap):
+            return None
+        return MetaState(
+            capacity=cap,
+            head=head,
+            tail=tail,
+            seq_next=seq_next,
+            commit=commit,
+            recover_start=recover_start,
+        )
 
     def _load_meta_with_slot(self) -> tuple[MetaState | None, int | None]:
         """Load the newest valid metadata slot and its slot index."""
@@ -721,7 +801,10 @@ class SDSavior:
         if s.tail == s.head:
             return
 
-        off = s.tail
+        off = self._recover_scan_start()
+        if off == s.head:
+            return
+
         last_good_off = off
         last_seq: int | None = None
         scanned = 0
@@ -730,13 +813,14 @@ class SDSavior:
         else:
             limit = self.recover_scan_limit_bytes
         truncated = False
+        changed = False
 
         while off != s.head and scanned < limit:
             rec = self._read_record(off)
             if rec is None:
                 s.head = last_good_off
-                s.commit += 1
-                self._write_meta(s)
+                s.recover_start = s.head
+                changed = True
                 truncated = True
                 break
 
@@ -744,8 +828,8 @@ class SDSavior:
             step = self._distance(off, next_off)
             if step <= 0:
                 s.head = last_good_off
-                s.commit += 1
-                self._write_meta(s)
+                s.recover_start = s.head
+                changed = True
                 truncated = True
                 break
 
@@ -762,10 +846,17 @@ class SDSavior:
 
         if not truncated and scanned >= limit and off != s.head:
             s.head = last_good_off
-            s.commit += 1
-            self._write_meta(s)
+            s.recover_start = s.head
+            changed = True
+
+        if not truncated and off == s.head and s.recover_start != s.head:
+            s.recover_start = s.head
+            changed = True
 
         if last_seq is not None and s.seq_next <= last_seq:
             s.seq_next = last_seq + 1
+            changed = True
+
+        if changed:
             s.commit += 1
             self._write_meta(s)
