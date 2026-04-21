@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v1.0.3 (2026-04-21)
+
+### Chores
+
+- Benchmark suite
+  ([`ed27972`](https://github.com/well-it-wasnt-me/SDSavior/commit/ed27972e1ad7abd8f9798b75b3be261139ede56f))
+
+### Performance Improvements
+
+- Add recovery checkpoints and raw JSON append path
+  ([`798e8eb`](https://github.com/well-it-wasnt-me/SDSavior/commit/798e8eba2d9622a9de0854a80df262583baac35a))
+
+- Reduce append overhead and improve wrap recovery
+  ([`a2a707a`](https://github.com/well-it-wasnt-me/SDSavior/commit/a2a707addc1f3cd78de4a22512b4be3dca03f8e4))
+
+
 ## v1.0.2 (2026-03-04)
 
 ### Bug Fixes
