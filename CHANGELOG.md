@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.1.0 (2026-04-21)
+
+### Features
+
+- Add opt-in group commit batching
+  ([`8c2a10f`](https://github.com/well-it-wasnt-me/SDSavior/commit/8c2a10f206478f3d3f945b981a5e82de3e7e9563))
+
+
 ## v1.0.3 (2026-04-21)
 
 ### Chores
