@@ -8,7 +8,7 @@ import time
 import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 # -----------------------------
 # Low-level formats / constants
@@ -31,9 +31,12 @@ assert DATA_START == 4, "DATA_MAGIC must be 4 bytes for u32 alignment."
 # padding     0..7  (to 8-byte alignment)
 RECORD_HDR = struct.Struct("<IIQQII")  # 4+4+8+8+4+4 = 32 bytes
 RECORD_HDR_SIZE = RECORD_HDR.size      # 32
+CRC_HDR = struct.Struct("<QQII")
 ALIGN = 8
 WRAP_MARKER = 0xFFFFFFFF
 ZERO_PADDING = b"\x00" * (ALIGN - 1)
+WRAP_MARKER_PADDING = b"\x00" * (RECORD_HDR_SIZE - DATA_START)
+MMAP_PAGE_SIZE = mmap.PAGESIZE
 
 # Meta header layout (one slot):
 # magic[4], version u32, capacity u64,
@@ -116,6 +119,12 @@ class SDSavior:
             }
         else:
             self.json_dumps_kwargs = dict(json_dumps_kwargs)
+        encoder_cls = cast(
+            type[json.JSONEncoder],
+            self.json_dumps_kwargs.get("cls") or json.JSONEncoder,
+        )
+        encoder_kwargs: Any = {k: v for k, v in self.json_dumps_kwargs.items() if k != "cls"}
+        self._json_encoder = encoder_cls(**encoder_kwargs)
         self.recover_scan_limit_bytes = recover_scan_limit_bytes
 
         self._data_fd: int | None = None
@@ -123,6 +132,7 @@ class SDSavior:
         self._data_mm: mmap.mmap | None = None
         self._meta_mm: mmap.mmap | None = None
         self._state: MetaState | None = None
+        self._current_meta_slot: int | None = None
 
     def __enter__(self) -> SDSavior:
         """Open the ring buffer when entering a ``with`` block."""
@@ -213,6 +223,7 @@ class SDSavior:
                         f"Use the same capacity or create new files."
                     )
                 self._state = loaded
+                self._current_meta_slot = self._find_meta_slot(loaded)
 
             self._recover()
         except Exception:
@@ -252,6 +263,7 @@ class SDSavior:
                 self._meta_fd = None
 
             self._state = None
+            self._current_meta_slot = None
 
     def _cleanup_open_handles(self) -> None:
         """Best-effort cleanup of mapped files and fds without persisting metadata."""
@@ -272,6 +284,7 @@ class SDSavior:
             self._meta_fd = None
 
         self._state = None
+        self._current_meta_slot = None
 
     def append(self, obj: Any) -> int:
         """
@@ -285,9 +298,8 @@ class SDSavior:
         s = self._state
         mm = self._data_mm
         data_fd = self._data_fd
-        dump_kwargs: Any = self.json_dumps_kwargs
 
-        payload = (json.dumps(obj, **dump_kwargs) + "\n").encode("utf-8")
+        payload = (self._json_encoder.encode(obj) + "\n").encode("utf-8")
         payload_len = len(payload)
         total_len = _align_up(RECORD_HDR_SIZE + payload_len, ALIGN)
 
@@ -298,21 +310,24 @@ class SDSavior:
 
         head = s.head
         if head + total_len > self.capacity:
+            old_head = head
+            was_empty = s.tail == old_head
             self._write_wrap_marker(head)
             head = DATA_START
             s.head = head
-            self._make_space(total_len)
+            if was_empty:
+                s.tail = DATA_START
+            else:
+                self._evict_start_region(DATA_START + total_len)
 
         seq = s.seq_next
         ts_ns = time.time_ns()
 
         reserved = 0
-        hdr_wo_total_crc = struct.pack("<QQII", seq, ts_ns, payload_len, reserved)
-        crc = _crc32_bytes(hdr_wo_total_crc + payload)
+        hdr_wo_total_crc = CRC_HDR.pack(seq, ts_ns, payload_len, reserved)
+        crc = zlib.crc32(payload, zlib.crc32(hdr_wo_total_crc)) & 0xFFFFFFFF
 
-        hdr = RECORD_HDR.pack(total_len, crc, seq, ts_ns, payload_len, reserved)
-
-        mm[head:head + RECORD_HDR_SIZE] = hdr
+        RECORD_HDR.pack_into(mm, head, total_len, crc, seq, ts_ns, payload_len, reserved)
         mm[head + RECORD_HDR_SIZE:head + RECORD_HDR_SIZE + payload_len] = payload
 
         pad_start = head + RECORD_HDR_SIZE + payload_len
@@ -327,11 +342,11 @@ class SDSavior:
         s.seq_next = seq + 1
         s.commit += 1
 
-        self._write_meta(s)
-
         if self.fsync_data:
-            mm.flush()  # flush entire mapping (simple + safe)
+            self._flush_data_range(head, total_len)
             os.fsync(data_fd)
+
+        self._write_meta(s)
 
         return seq
 
@@ -371,10 +386,9 @@ class SDSavior:
     def export_jsonl(self, out_path: str, *, from_seq: int | None = None) -> None:
         """Write current records to a JSONL file, optionally starting from a sequence number."""
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-        dump_kwargs: Any = self.json_dumps_kwargs
         with open(out_path, "wb") as f:
             for _seq, _ts_ns, obj in self.iter_records(from_seq=from_seq):
-                line = (json.dumps(obj, **dump_kwargs) + "\n").encode("utf-8")
+                line = (self._json_encoder.encode(obj) + "\n").encode("utf-8")
                 f.write(line)
 
     # ---------- internals ----------
@@ -397,6 +411,39 @@ class SDSavior:
         if st.st_size != size:
             os.ftruncate(fd, size)
 
+    @staticmethod
+    def _pwrite_all(fd: int, data: bytes, offset: int) -> None:
+        """Write all bytes at ``offset`` without disturbing the file position."""
+        view = memoryview(data)
+        written = 0
+        while written < len(data):
+            if hasattr(os, "pwrite"):
+                n = os.pwrite(fd, view[written:], offset + written)
+            else:
+                os.lseek(fd, offset + written, os.SEEK_SET)
+                n = os.write(fd, view[written:])
+            if n == 0:
+                raise OSError("short write while persisting metadata")
+            written += n
+
+    def _write_meta_bytes(self, raw: bytes, offset: int) -> None:
+        """Persist one packed metadata slot through the file descriptor."""
+        assert self._meta_fd is not None
+        self._pwrite_all(self._meta_fd, raw, offset)
+
+    def _flush_data_range(self, off: int, length: int) -> None:
+        """Flush the touched data-file pages for a write range."""
+        assert self._data_mm is not None
+        if length <= 0:
+            return
+        page_off = off - (off % MMAP_PAGE_SIZE)
+        flush_end = min(self.capacity, off + length)
+        flush_len = flush_end - page_off
+        try:
+            self._data_mm.flush(page_off, flush_len)
+        except (OSError, ValueError):
+            self._data_mm.flush()
+
     def _write_wrap_marker(self, off: int) -> None:
         """Write a wrap marker at ``off`` so readers restart from ``DATA_START``."""
         assert self._data_mm is not None
@@ -404,13 +451,11 @@ class SDSavior:
         mm = self._data_mm
         data_fd = self._data_fd
 
-        mm[off:off + DATA_START] = struct.pack("<I", WRAP_MARKER)
+        struct.pack_into("<I", mm, off, WRAP_MARKER)
         if off + RECORD_HDR_SIZE <= self.capacity:
-            mm[off + DATA_START:off + RECORD_HDR_SIZE] = b"\x00" * (RECORD_HDR_SIZE - DATA_START)
-        # Some platforms require page-aligned offsets for flush/msync.
-        # Wrap marker writes are tiny, so flush the whole mapping.
-        mm.flush()
+            mm[off + DATA_START:off + RECORD_HDR_SIZE] = WRAP_MARKER_PADDING
         if self.fsync_data:
+            self._flush_data_range(off, min(RECORD_HDR_SIZE, self.capacity - off))
             os.fsync(data_fd)
 
     def _read_record(self, off: int) -> ParsedRecord | None:
@@ -439,8 +484,8 @@ class SDSavior:
             return None
 
         payload = mm[off + RECORD_HDR_SIZE: off + RECORD_HDR_SIZE + payload_len]
-        hdr_wo_total_crc = struct.pack("<QQII", seq, ts_ns, payload_len, 0)
-        if _crc32_bytes(hdr_wo_total_crc + payload) != crc:
+        hdr_wo_total_crc = CRC_HDR.pack(seq, ts_ns, payload_len, 0)
+        if (zlib.crc32(payload, zlib.crc32(hdr_wo_total_crc)) & 0xFFFFFFFF) != crc:
             return None
 
         try:
@@ -452,6 +497,41 @@ class SDSavior:
         if next_off >= self.capacity:
             next_off = DATA_START
         return ("rec", next_off, seq, ts_ns, obj)
+
+    def _read_record_bounds(self, off: int) -> ParsedRecord | None:
+        """Validate a record enough to advance over it without decoding JSON."""
+        assert self._data_mm is not None
+        mm = self._data_mm
+
+        if off < DATA_START or off + DATA_START > self.capacity:
+            return None
+
+        (total_len,) = struct.unpack_from("<I", mm, off)
+        if total_len == WRAP_MARKER:
+            if off == DATA_START:
+                return None
+            return ("wrap", DATA_START, 0, 0, None)
+
+        if total_len < RECORD_HDR_SIZE or total_len > self.capacity:
+            return None
+        if off + total_len > self.capacity:
+            return None
+
+        total_len, crc, seq, ts_ns, payload_len, reserved = RECORD_HDR.unpack_from(mm, off)
+        if reserved != 0:
+            return None
+        if (RECORD_HDR_SIZE + payload_len) > total_len:
+            return None
+
+        payload = mm[off + RECORD_HDR_SIZE: off + RECORD_HDR_SIZE + payload_len]
+        hdr_wo_total_crc = CRC_HDR.pack(seq, ts_ns, payload_len, 0)
+        if (zlib.crc32(payload, zlib.crc32(hdr_wo_total_crc)) & 0xFFFFFFFF) != crc:
+            return None
+
+        next_off = off + total_len
+        if next_off >= self.capacity:
+            next_off = DATA_START
+        return ("rec", next_off, seq, ts_ns, None)
 
     def _distance(self, a: int, b: int) -> int:
         """Return ring distance from offset ``a`` to ``b`` respecting wrap-around."""
@@ -469,21 +549,64 @@ class SDSavior:
         """Advance tail until at least ``need`` bytes are free for a new record."""
         assert self._state is not None
         s = self._state
-        free = (self.capacity - DATA_START) - self._used_bytes()
-        if need <= free:
-            return
+        ring_bytes = self.capacity - DATA_START
+        free = ring_bytes - self._used_bytes()
 
         tail_changed = False
-        while need > ((self.capacity - DATA_START) - self._used_bytes()):
-            rec = self._read_record(s.tail)
+        while need > free:
+            rec = self._read_record_bounds(s.tail)
             if rec is None:
                 if s.tail != s.head:
+                    free += self._distance(s.tail, s.head)
                     s.tail = s.head
                     tail_changed = True
                 break
-            kind, next_off, *_ = rec
+            _kind, next_off, *_ = rec
+            free += self._distance(s.tail, next_off)
             s.tail = next_off
             tail_changed = True
+
+        overwrite_end = s.head + need
+        if overwrite_end <= self.capacity:
+            while s.head < s.tail <= overwrite_end:
+                rec = self._read_record_bounds(s.tail)
+                if rec is None:
+                    if s.tail != s.head:
+                        s.tail = s.head
+                        tail_changed = True
+                    break
+                _kind, next_off, *_ = rec
+                s.tail = next_off
+                tail_changed = True
+                if next_off == DATA_START:
+                    break
+
+        if tail_changed:
+            s.commit += 1
+
+    def _evict_start_region(self, end_off: int) -> None:
+        """Advance tail past the region about to be overwritten after a wrap."""
+        assert self._state is not None
+        s = self._state
+        tail_changed = False
+
+        while DATA_START <= s.tail <= end_off:
+            rec = self._read_record_bounds(s.tail)
+            if rec is None:
+                s.tail = s.head
+                tail_changed = True
+                break
+
+            kind, next_off, *_ = rec
+            if kind == "wrap":
+                s.tail = DATA_START
+                tail_changed = True
+                break
+
+            s.tail = next_off
+            tail_changed = True
+            if next_off == DATA_START:
+                break
 
         if tail_changed:
             s.commit += 1
@@ -535,8 +658,8 @@ class SDSavior:
             return None
         return MetaState(capacity=cap, head=head, tail=tail, seq_next=seq_next, commit=commit)
 
-    def _load_meta(self) -> MetaState | None:
-        """Load the newest valid metadata slot, or ``None`` if both are invalid."""
+    def _load_meta_with_slot(self) -> tuple[MetaState | None, int | None]:
+        """Load the newest valid metadata slot and its slot index."""
         assert self._meta_mm is not None
         mm = self._meta_mm
         slot0 = mm[0:META_HDR_SIZE]
@@ -546,28 +669,47 @@ class SDSavior:
         st1 = self._unpack_meta(slot1)
 
         if st0 and st1:
-            return st0 if st0.commit >= st1.commit else st1
-        return st0 or st1
+            if st0.commit >= st1.commit:
+                return st0, 0
+            return st1, 1
+        if st0:
+            return st0, 0
+        if st1:
+            return st1, 1
+        return None, None
+
+    def _load_meta(self) -> MetaState | None:
+        """Load the newest valid metadata slot, or ``None`` if both are invalid."""
+        state, _slot = self._load_meta_with_slot()
+        return state
+
+    def _find_meta_slot(self, st: MetaState) -> int | None:
+        """Return the slot containing ``st`` when it can be identified."""
+        assert self._meta_mm is not None
+        for slot in range(META_SLOTS):
+            start = slot * META_HDR_SIZE
+            candidate = self._unpack_meta(self._meta_mm[start:start + META_HDR_SIZE])
+            if candidate == st:
+                return slot
+        return None
 
     def _write_meta(self, st: MetaState) -> None:
         """Persist metadata into the alternate slot and optionally fsync it."""
         assert self._meta_mm is not None
         assert self._meta_fd is not None
         mm = self._meta_mm
-        cur = self._load_meta()
-        if cur is None:
+        if self._current_meta_slot is None:
             target_slot = 0
         else:
-            target_slot = 1 if (cur.commit % 2 == 0) else 0
+            target_slot = 1 - self._current_meta_slot
 
         raw = self._pack_meta(st)
         start = target_slot * META_HDR_SIZE
         mm[start:start + META_HDR_SIZE] = raw
-        # Some platforms require page-aligned offsets for flush/msync.
-        # Meta is tiny, so flush the whole mapping.
-        mm.flush()
         if self.fsync_meta:
+            self._write_meta_bytes(raw, start)
             os.fsync(self._meta_fd)
+        self._current_meta_slot = target_slot
 
     # ---------- crash recovery scan ----------
 

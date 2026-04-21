@@ -13,6 +13,7 @@ from sdsavior import SDSavior, cli
 from sdsavior.ring import (
     DATA_START,
     META_FILE_SIZE,
+    META_HDR_SIZE,
     RECORD_HDR,
     RECORD_HDR_SIZE,
     WRAP_MARKER,
@@ -77,6 +78,30 @@ def test_wraparound_end_to_end_via_public_api(
     assert seqs == list(range(seqs[0], seqs[0] + len(seqs)))
     assert nums == list(range(nums[0], nums[0] + len(nums)))
     assert nums[-1] == 299
+
+
+def test_wraparound_preserves_records_before_and_after_wrap(tmp_path: Path) -> None:
+    """Ensure wrapping does not discard the whole pre-wrap segment."""
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with SDSavior(str(data), str(meta), 16 * 1024, fsync_meta=False) as rb:
+        previous_head = DATA_START
+        for i in range(100):
+            rb.append({"n": i, "payload": "x" * 512})
+            assert rb._state is not None
+            if rb._state.head < previous_head:
+                rows = list(rb.iter_records())
+                nums = [row[2]["n"] for row in rows]
+
+                assert len(nums) > 1
+                assert nums[-1] == i
+                assert nums[0] < i
+                assert nums == list(range(nums[0], nums[-1] + 1))
+                break
+            previous_head = rb._state.head
+        else:
+            pytest.fail("append workload did not trigger wraparound")
 
 
 def test_recover_truncates_on_crc_corruption(tmp_path: Path) -> None:
@@ -317,6 +342,26 @@ def test_open_rejects_meta_capacity_mismatch(tmp_path: Path) -> None:
     rb2 = SDSavior(str(data), str(meta), capacity)
     with pytest.raises(ValueError, match="Meta capacity"):
         rb2.open()
+
+
+def test_meta_double_buffer_keeps_previous_valid_slot(tmp_path: Path) -> None:
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with SDSavior(str(data), str(meta), 16 * 1024, fsync_meta=False) as rb:
+        rb.append({"n": 1})
+        assert rb._meta_mm is not None
+        assert rb._current_meta_slot is not None
+
+        latest_start = rb._current_meta_slot * META_HDR_SIZE
+        original = rb._meta_mm[latest_start]
+        rb._meta_mm[latest_start] = original ^ 0xFF
+        try:
+            loaded = rb._load_meta()
+            assert loaded is not None
+            assert loaded.commit == 1
+        finally:
+            rb._meta_mm[latest_start] = original
 
 
 def test_iter_records_breaks_on_corrupt_record(tmp_path: Path) -> None:
