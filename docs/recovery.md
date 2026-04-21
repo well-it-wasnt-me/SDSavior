@@ -48,3 +48,8 @@ This keeps unreadable partial writes out of normal iteration.
 `fsync_data=True` advances the checkpoint after each durable append. The optional
 `recovery_checkpoint_interval_records` setting can also create periodic checkpoints
 by flushing data pages and storing the current `head`.
+
+When `group_commit_records` is set, those durability and checkpoint updates are
+batched. Crash consistency is still protected by record CRC validation and metadata
+CRC slots, but the strongest durability point becomes the last completed group commit
+or explicit `commit()`.

@@ -111,6 +111,7 @@ def render_report(
         "- `none`: no per-append durability step.",
         "- `meta_only`: SDSavior only, `fsync_data=False, fsync_meta=True`.",
         "- `full_fsync`: strongest per-append durability mode for each backend.",
+        "- `group_fsync`: SDSavior only, full durability fsyncs batched every 16 records.",
         "- `file` and `mmap` are baselines, not feature-equivalent replacements for SDSavior.",
     ])
     return "\n".join(lines) + "\n"

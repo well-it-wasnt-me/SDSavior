@@ -101,6 +101,7 @@ class SDSavior:
         json_dumps_kwargs: dict[str, Any] | None = None,
         recover_scan_limit_bytes: int | None = None,
         recovery_checkpoint_interval_records: int | None = None,
+        group_commit_records: int | None = None,
     ):
         """Configure file paths, durability options, and recovery behavior for a ring instance."""
         capacity = int(capacity_bytes)
@@ -113,6 +114,8 @@ class SDSavior:
             and recovery_checkpoint_interval_records <= 0
         ):
             raise ValueError("recovery_checkpoint_interval_records must be positive.")
+        if group_commit_records is not None and group_commit_records <= 0:
+            raise ValueError("group_commit_records must be positive.")
 
         self.data_path = data_path
         self.meta_path = meta_path
@@ -134,6 +137,7 @@ class SDSavior:
         self._json_encoder = encoder_cls(**encoder_kwargs)
         self.recover_scan_limit_bytes = recover_scan_limit_bytes
         self.recovery_checkpoint_interval_records = recovery_checkpoint_interval_records
+        self.group_commit_records = group_commit_records
 
         self._data_fd: int | None = None
         self._meta_fd: int | None = None
@@ -142,6 +146,8 @@ class SDSavior:
         self._state: MetaState | None = None
         self._current_meta_slot: int | None = None
         self._records_since_recovery_checkpoint = 0
+        self._records_since_group_commit = 0
+        self._pending_data_ranges: list[tuple[int, int]] = []
 
     def __enter__(self) -> SDSavior:
         """Open the ring buffer when entering a ``with`` block."""
@@ -253,10 +259,16 @@ class SDSavior:
         try:
             if self._state is not None:
                 if self._data_mm is not None:
-                    self._data_mm.flush()
                     if self.fsync_data or self.recovery_checkpoint_interval_records is not None:
-                        self._state.recover_start = self._state.head
-                self._write_meta(self._state)
+                        self._commit_pending(
+                            flush_data=True,
+                            fsync_data=self.fsync_data,
+                            advance_checkpoint=True,
+                            force_meta_fsync=True,
+                        )
+                    else:
+                        self._data_mm.flush()
+                        self._write_meta(self._state)
         finally:
             if self._data_mm is not None:
                 self._data_mm.flush()
@@ -279,6 +291,8 @@ class SDSavior:
             self._state = None
             self._current_meta_slot = None
             self._records_since_recovery_checkpoint = 0
+            self._records_since_group_commit = 0
+            self._pending_data_ranges.clear()
 
     def _cleanup_open_handles(self) -> None:
         """Best-effort cleanup of mapped files and fds without persisting metadata."""
@@ -301,6 +315,8 @@ class SDSavior:
         self._state = None
         self._current_meta_slot = None
         self._records_since_recovery_checkpoint = 0
+        self._records_since_group_commit = 0
+        self._pending_data_ranges.clear()
 
     def append(self, obj: Any) -> int:
         """
@@ -321,6 +337,22 @@ class SDSavior:
         if not payload.endswith(b"\n"):
             payload += b"\n"
         return self._append_payload(payload)
+
+    def commit(self) -> None:
+        """
+        Flush pending grouped writes according to the configured durability flags.
+
+        This is useful when ``group_commit_records`` is enabled and the caller wants
+        an explicit commit boundary before the batch fills.
+        """
+        self._require_open()
+        self._commit_pending(
+            flush_data=self.fsync_data or self.recovery_checkpoint_interval_records is not None,
+            fsync_data=self.fsync_data,
+            advance_checkpoint=self.fsync_data
+            or self.recovery_checkpoint_interval_records is not None,
+            force_meta_fsync=True,
+        )
 
     def _append_payload(self, payload: bytes) -> int:
         """Append one UTF-8 JSON-line payload to the ring."""
@@ -366,6 +398,10 @@ class SDSavior:
         pad_end = head + total_len
         if pad_end > pad_start:
             mm[pad_start:pad_end] = ZERO_PADDING[:pad_end - pad_start]
+        if self.group_commit_records is not None and (
+            self.fsync_data or self.recovery_checkpoint_interval_records is not None
+        ):
+            self._mark_pending_data_range(head, total_len)
 
         s.head = head + total_len
         if s.head >= self.capacity:
@@ -374,26 +410,41 @@ class SDSavior:
         s.seq_next = seq + 1
         s.commit += 1
 
-        if self.fsync_data:
+        checkpoint_due = False
+        if self.recovery_checkpoint_interval_records is not None:
+            self._records_since_recovery_checkpoint += 1
+            checkpoint_due = (
+                self._records_since_recovery_checkpoint
+                >= self.recovery_checkpoint_interval_records
+            )
+
+        if self.group_commit_records is not None:
+            self._records_since_group_commit += 1
+            group_due = self._records_since_group_commit >= self.group_commit_records
+            if group_due or checkpoint_due:
+                self._commit_pending(
+                    flush_data=self.fsync_data or checkpoint_due,
+                    fsync_data=self.fsync_data,
+                    advance_checkpoint=self.fsync_data or checkpoint_due,
+                    force_meta_fsync=True,
+                )
+            else:
+                self._normalize_recover_start()
+                self._write_meta(s, force_fsync=False)
+        elif self.fsync_data:
             self._flush_data_range(head, total_len)
             os.fsync(data_fd)
             s.recover_start = s.head
             self._records_since_recovery_checkpoint = 0
-        elif self.recovery_checkpoint_interval_records is not None:
-            self._records_since_recovery_checkpoint += 1
-            if (
-                self._records_since_recovery_checkpoint
-                >= self.recovery_checkpoint_interval_records
-            ):
-                mm.flush()
-                s.recover_start = s.head
-                self._records_since_recovery_checkpoint = 0
-            else:
-                self._normalize_recover_start()
+            self._write_meta(s)
+        elif checkpoint_due:
+            mm.flush()
+            s.recover_start = s.head
+            self._records_since_recovery_checkpoint = 0
+            self._write_meta(s)
         else:
             self._normalize_recover_start()
-
-        self._write_meta(s)
+            self._write_meta(s)
 
         return seq
 
@@ -491,6 +542,79 @@ class SDSavior:
         except (OSError, ValueError):
             self._data_mm.flush()
 
+    def _mark_pending_data_range(self, off: int, length: int) -> None:
+        """Record a touched data-file range for a later grouped durability flush."""
+        if length > 0:
+            self._pending_data_ranges.append((off, length))
+
+    def _flush_pending_data_ranges(self) -> bool:
+        """Flush pending grouped data ranges, merging page-aligned overlaps."""
+        assert self._data_mm is not None
+        if not self._pending_data_ranges:
+            return False
+
+        page_ranges: list[tuple[int, int]] = []
+        for off, length in self._pending_data_ranges:
+            if length <= 0:
+                continue
+            page_off = off - (off % MMAP_PAGE_SIZE)
+            flush_end = min(self.capacity, off + length)
+            if flush_end > page_off:
+                page_ranges.append((page_off, flush_end))
+        self._pending_data_ranges.clear()
+
+        if not page_ranges:
+            return False
+
+        page_ranges.sort()
+        merged_start, merged_end = page_ranges[0]
+        for start, end in page_ranges[1:]:
+            if start <= merged_end:
+                merged_end = max(merged_end, end)
+                continue
+            self._flush_data_pages(merged_start, merged_end - merged_start)
+            merged_start = start
+            merged_end = end
+        self._flush_data_pages(merged_start, merged_end - merged_start)
+        return True
+
+    def _flush_data_pages(self, page_off: int, length: int) -> None:
+        """Flush an already page-aligned data range with whole-map fallback."""
+        assert self._data_mm is not None
+        try:
+            self._data_mm.flush(page_off, length)
+        except (OSError, ValueError):
+            self._data_mm.flush()
+
+    def _commit_pending(
+        self,
+        *,
+        flush_data: bool,
+        fsync_data: bool,
+        advance_checkpoint: bool,
+        force_meta_fsync: bool,
+    ) -> None:
+        """Commit pending grouped metadata and optional data durability work."""
+        assert self._state is not None
+        assert self._data_mm is not None
+        assert self._data_fd is not None
+        s = self._state
+
+        if flush_data:
+            if not self._flush_pending_data_ranges():
+                self._data_mm.flush()
+            if fsync_data:
+                os.fsync(self._data_fd)
+
+        if advance_checkpoint:
+            s.recover_start = s.head
+            self._records_since_recovery_checkpoint = 0
+        else:
+            self._normalize_recover_start()
+
+        self._write_meta(s, force_fsync=force_meta_fsync)
+        self._records_since_group_commit = 0
+
     def _write_wrap_marker(self, off: int) -> None:
         """Write a wrap marker at ``off`` so readers restart from ``DATA_START``."""
         assert self._data_mm is not None
@@ -501,8 +625,13 @@ class SDSavior:
         struct.pack_into("<I", mm, off, WRAP_MARKER)
         if off + RECORD_HDR_SIZE <= self.capacity:
             mm[off + DATA_START:off + RECORD_HDR_SIZE] = WRAP_MARKER_PADDING
-        if self.fsync_data:
-            self._flush_data_range(off, min(RECORD_HDR_SIZE, self.capacity - off))
+        flush_len = min(RECORD_HDR_SIZE, self.capacity - off)
+        if self.group_commit_records is not None and (
+            self.fsync_data or self.recovery_checkpoint_interval_records is not None
+        ):
+            self._mark_pending_data_range(off, flush_len)
+        elif self.fsync_data:
+            self._flush_data_range(off, flush_len)
             os.fsync(data_fd)
 
     def _read_record(self, off: int) -> ParsedRecord | None:
@@ -773,7 +902,7 @@ class SDSavior:
                 return slot
         return None
 
-    def _write_meta(self, st: MetaState) -> None:
+    def _write_meta(self, st: MetaState, *, force_fsync: bool | None = None) -> None:
         """Persist metadata into the alternate slot and optionally fsync it."""
         assert self._meta_mm is not None
         assert self._meta_fd is not None
@@ -786,7 +915,8 @@ class SDSavior:
         raw = self._pack_meta(st)
         start = target_slot * META_HDR_SIZE
         mm[start:start + META_HDR_SIZE] = raw
-        if self.fsync_meta:
+        should_fsync = self.fsync_meta if force_fsync is None else self.fsync_meta and force_fsync
+        if should_fsync:
             self._write_meta_bytes(raw, start)
             os.fsync(self._meta_fd)
         self._current_meta_slot = target_slot

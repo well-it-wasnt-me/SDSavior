@@ -89,6 +89,20 @@ def test_recovery_checkpoint_interval_must_be_positive(tmp_path: Path) -> None:
         )
 
 
+def test_group_commit_records_must_be_positive(tmp_path: Path) -> None:
+    """Reject non-positive group commit batch sizes."""
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+
+    with pytest.raises(ValueError, match="group_commit_records"):
+        SDSavior(
+            str(data),
+            str(meta),
+            256 * 1024,
+            group_commit_records=0,
+        )
+
+
 def test_json_kwargs_are_copied(tmp_path: Path) -> None:
     """Ensure caller-owned JSON kwargs are copied, not referenced."""
     data = tmp_path / "ring.dat"
@@ -167,6 +181,106 @@ def test_append_fsyncs_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         fsync_calls.clear()
         rb.append({"n": 1})
         assert fsync_calls == [data_fd]
+
+
+def test_group_commit_batches_data_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify grouped commits batch data fsync calls until the configured boundary."""
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+    fsync_calls: list[int] = []
+
+    def fake_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+
+    monkeypatch.setattr("sdsavior.ring.os.fsync", fake_fsync)
+
+    with SDSavior(
+        str(data),
+        str(meta),
+        16 * 1024,
+        fsync_data=True,
+        fsync_meta=False,
+        group_commit_records=3,
+    ) as rb:
+        assert rb._data_fd is not None
+        data_fd = rb._data_fd
+        fsync_calls.clear()
+
+        rb.append({"n": 1})
+        rb.append({"n": 2})
+        assert fsync_calls == []
+
+        rb.append({"n": 3})
+        assert fsync_calls == [data_fd]
+
+
+def test_group_commit_explicit_commit_flushes_pending_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify explicit commit can end a data fsync batch early."""
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+    fsync_calls: list[int] = []
+
+    def fake_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+
+    monkeypatch.setattr("sdsavior.ring.os.fsync", fake_fsync)
+
+    with SDSavior(
+        str(data),
+        str(meta),
+        16 * 1024,
+        fsync_data=True,
+        fsync_meta=False,
+        group_commit_records=10,
+    ) as rb:
+        assert rb._data_fd is not None
+        data_fd = rb._data_fd
+        fsync_calls.clear()
+
+        rb.append({"n": 1})
+        assert fsync_calls == []
+
+        rb.commit()
+        assert fsync_calls == [data_fd]
+
+
+def test_group_commit_batches_meta_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify grouped commits delay metadata fsync until the configured boundary."""
+    data = tmp_path / "ring.dat"
+    meta = tmp_path / "ring.meta"
+    fsync_calls: list[int] = []
+
+    def fake_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+
+    monkeypatch.setattr("sdsavior.ring.os.fsync", fake_fsync)
+
+    with SDSavior(
+        str(data),
+        str(meta),
+        16 * 1024,
+        fsync_data=False,
+        fsync_meta=True,
+        group_commit_records=2,
+    ) as rb:
+        assert rb._meta_fd is not None
+        meta_fd = rb._meta_fd
+        fsync_calls.clear()
+
+        rb.append({"n": 1})
+        assert fsync_calls == []
+
+        rb.append({"n": 2})
+        assert fsync_calls == [meta_fd]
 
 
 def test_write_wrap_marker_fsyncs_data_when_enabled(

@@ -111,6 +111,12 @@ Defines how aggressively data is flushed to disk.
 * slowest
 * **strongest durability guarantee**
 
+### `group_fsync` (SDSavior only)
+
+* data and metadata fsyncs are batched
+* currently commits every 16 records
+* **stronger throughput with a wider durability window**
+
 ---
 
 ## 5. rps (records per second)
@@ -212,7 +218,7 @@ Use:
 
 Use:
 
-* sdsavior (meta_only or full_fsync)
+* sdsavior (meta_only, full_fsync, or group_fsync)
 
 ## If you care about correctness after crashes
 

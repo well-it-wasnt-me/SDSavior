@@ -56,6 +56,7 @@ def record(i: int) -> bytes:
     return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n"
 
 if backend == "sdsavior":
+    group_commit_records = None
     if durability_mode == "none":
         fsync_data = False
         fsync_meta = False
@@ -65,6 +66,10 @@ if backend == "sdsavior":
     elif durability_mode == "full_fsync":
         fsync_data = True
         fsync_meta = True
+    elif durability_mode == "group_fsync":
+        fsync_data = True
+        fsync_meta = True
+        group_commit_records = 16
     else:
         raise ValueError(durability_mode)
 
@@ -74,6 +79,7 @@ if backend == "sdsavior":
         capacity_bytes=capacity_bytes,
         fsync_data=fsync_data,
         fsync_meta=fsync_meta,
+        group_commit_records=group_commit_records,
     )
     rb.open()
 
@@ -125,8 +131,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--durability-mode",
         action="append",
-        choices=["none", "meta_only", "full_fsync"],
-        default=["none", "meta_only", "full_fsync"],
+        choices=["none", "meta_only", "full_fsync", "group_fsync"],
+        default=["none", "meta_only", "full_fsync", "group_fsync"],
     )
     parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument("--markdown-out", type=Path, default=None)
@@ -135,7 +141,7 @@ def parse_args() -> argparse.Namespace:
 
 def is_supported_combo(backend: str, durability_mode: str) -> bool:
     if backend == "sdsavior":
-        return durability_mode in {"none", "meta_only", "full_fsync"}
+        return durability_mode in {"none", "meta_only", "full_fsync", "group_fsync"}
     return durability_mode in {"none", "full_fsync"}
 
 
@@ -177,6 +183,7 @@ def recover(
     t0 = time.perf_counter()
 
     if backend == "sdsavior":
+        group_commit_records = None
         if durability_mode == "none":
             fsync_data = False
             fsync_meta = False
@@ -186,6 +193,10 @@ def recover(
         elif durability_mode == "full_fsync":
             fsync_data = True
             fsync_meta = True
+        elif durability_mode == "group_fsync":
+            fsync_data = True
+            fsync_meta = True
+            group_commit_records = 16
         else:
             raise ValueError(durability_mode)
 
@@ -195,6 +206,7 @@ def recover(
             capacity_bytes=capacity_bytes,
             fsync_data=fsync_data,
             fsync_meta=fsync_meta,
+            group_commit_records=group_commit_records,
         )
         rb.open()
         try:
@@ -315,6 +327,7 @@ def markdown_table(summary_rows: list[dict[str, Any]]) -> str:
         "",
         "- `file` and `mmap` recovery means how much valid data can be read after a forced kill.",
         "- `sdsavior` recovery measures reopen plus `iter_records()` after the same crash pattern.",
+        "- `group_fsync` is SDSavior only, with full durability fsyncs batched every 16 records.",
     ])
     return "\n".join(lines) + "\n"
 

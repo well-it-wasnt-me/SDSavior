@@ -15,12 +15,13 @@ Dataclass storing persisted pointer state:
 
 ### Constructor
 
-`SDSavior(data_path, meta_path, capacity_bytes, *, fsync_data=False, fsync_meta=True, json_dumps_kwargs=None, recover_scan_limit_bytes=None, recovery_checkpoint_interval_records=None)`
+`SDSavior(data_path, meta_path, capacity_bytes, *, fsync_data=False, fsync_meta=True, json_dumps_kwargs=None, recover_scan_limit_bytes=None, recovery_checkpoint_interval_records=None, group_commit_records=None)`
 
 - `capacity_bytes` must be a multiple of 8 and at least 16 KiB.
 - `json_dumps_kwargs` is copied internally.
 - `recover_scan_limit_bytes` can cap recovery scanning.
 - `recovery_checkpoint_interval_records` can periodically checkpoint recovery start positions.
+- `group_commit_records` batches data and/or metadata fsync work across multiple appends.
 
 ### Lifecycle
 
@@ -32,6 +33,7 @@ Dataclass storing persisted pointer state:
 
 - `append(obj) -> int`: append JSON object and return assigned sequence.
 - `append_json_bytes(data) -> int`: append already-encoded JSON bytes and return assigned sequence.
+- `commit()`: flush pending grouped writes according to the configured durability flags.
 - `iter_records(from_seq=None)`: iterate `(seq, ts_ns, obj)` from tail to head.
 - `export_jsonl(out_path, from_seq=None)`: write records to JSONL file.
 

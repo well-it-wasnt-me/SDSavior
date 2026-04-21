@@ -43,11 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--durability-mode",
         action="append",
-        choices=["none", "meta_only", "full_fsync"],
-        default=["none", "meta_only", "full_fsync"],
+        choices=["none", "meta_only", "full_fsync", "group_fsync"],
+        default=["none", "meta_only", "full_fsync", "group_fsync"],
         help=(
             "none=file/mmap no fsync, meta_only=sdsavior only, "
-            "full_fsync=all backends fsync/msync"
+            "full_fsync=all backends fsync/msync, "
+            "group_fsync=sdsavior full fsync batched every 16 records"
         ),
     )
     parser.add_argument("--json-out", type=Path, default=None)
@@ -90,6 +91,7 @@ class BaseWriter:
 
 class SDSaviorWriter(BaseWriter):
     def __init__(self, data_path: Path, meta_path: Path, capacity_bytes: int, durability_mode: str):
+        group_commit_records = None
         if durability_mode == "none":
             fsync_data = False
             fsync_meta = False
@@ -99,6 +101,10 @@ class SDSaviorWriter(BaseWriter):
         elif durability_mode == "full_fsync":
             fsync_data = True
             fsync_meta = True
+        elif durability_mode == "group_fsync":
+            fsync_data = True
+            fsync_meta = True
+            group_commit_records = 16
         else:
             raise ValueError(f"Unsupported durability mode for SDSavior: {durability_mode}")
 
@@ -108,6 +114,7 @@ class SDSaviorWriter(BaseWriter):
             capacity_bytes=capacity_bytes,
             fsync_data=fsync_data,
             fsync_meta=fsync_meta,
+            group_commit_records=group_commit_records,
         )
         self._rb.open()
 
@@ -189,7 +196,7 @@ def create_writer(
 
 def is_supported_combo(backend: str, durability_mode: str) -> bool:
     if backend == "sdsavior":
-        return durability_mode in {"none", "meta_only", "full_fsync"}
+        return durability_mode in {"none", "meta_only", "full_fsync", "group_fsync"}
     return durability_mode in {"none", "full_fsync"}
 
 
@@ -318,6 +325,7 @@ def markdown_table(summary_rows: list[dict[str, Any]]) -> str:
         "- `none`: no fsync or flush-heavy durability step after each append.",
         "- `meta_only`: SDSavior only, `fsync_data=False, fsync_meta=True`.",
         "- `full_fsync`: strongest per-append durability mode for each backend.",
+        "- `group_fsync`: SDSavior only, full durability fsyncs batched every 16 records.",
     ])
     return "\n".join(lines) + "\n"
 

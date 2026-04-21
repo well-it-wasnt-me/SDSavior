@@ -52,10 +52,10 @@ sdsavior export --data data.ring --meta data.meta --capacity 8388608 --out out.j
 - Records are stored as JSON lines (`\\n` appended).
 - Metadata is double-buffered with CRC and a commit counter for crash recovery.
 - Already-encoded JSON can be written with `append_json_bytes(...)` to skip a decode/encode round trip.
+- `group_commit_records=N` can batch fsync work while keeping CRC-based crash recovery.
 - By default it does not fsync data pages on every append (to reduce wear); metadata is fsync'd.
 
 # TODO
 - fix ci for pypy publishing...
-- batching (group commit)
 - smarter fsync strategy
 - indexing / partial recovery scans

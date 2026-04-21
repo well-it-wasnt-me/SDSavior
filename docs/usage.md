@@ -55,5 +55,8 @@ with SDSavior("data.ring", "data.meta", 8 * 1024 * 1024) as rb:
 - `fsync_data=False` (default): data pages are not `fsync`'d on every append.
 - `recover_scan_limit_bytes=None` (default): scan up to capacity during recovery.
 - `recovery_checkpoint_interval_records=None` (default): do not add periodic recovery checkpoints.
+- `group_commit_records=None` (default): do not batch durability fsync work.
 
 Use `fsync_data=True` when stronger durability is required and throughput tradeoffs are acceptable.
+Use `group_commit_records=N` to batch durability work across `N` appends, or call `commit()`
+to flush the current batch explicitly.
